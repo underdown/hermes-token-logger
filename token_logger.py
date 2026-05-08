@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import os
 import time
 from datetime import datetime, timezone
@@ -102,8 +103,13 @@ class TokenLogger:
             path = self._filepath(date)
             is_new = not path.exists()
 
-            self._fh = gzip.open(path, mode="at", encoding="utf-8", compresslevel=6)
-            self._writer = csv.DictWriter(self._fh, fieldnames=self.CSV_HEADERS)
+            # Gzip doesn't support text-mode "a".  We open in binary append
+            # and wrap with TextIOWrapper to get a text-mode file handle.
+            self._fh = gzip.open(path, mode="ab", compresslevel=6)
+            self._writer = csv.DictWriter(
+                io.TextIOWrapper(self._fh, encoding="utf-8", write_through=True),
+                fieldnames=self.CSV_HEADERS,
+            )
             if is_new:
                 self._writer.writeheader()
 
@@ -216,15 +222,19 @@ def summarize_logs(days: int = 7) -> str:
     rows: list[dict] = []
 
     for gz_path in sorted(_TOKEN_LOG_DIR.glob("*.csv.gz")):
-        with gzip.open(gz_path, mode="rt", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                try:
-                    ts = datetime.fromisoformat(row["timestamp"]).timestamp()
-                    if ts < cutoff:
+        try:
+            with gzip.open(gz_path, mode="rb") as raw:
+                fh = io.TextIOWrapper(raw, encoding="utf-8")
+                for row in csv.DictReader(fh):
+                    try:
+                        ts = datetime.fromisoformat(row["timestamp"]).timestamp()
+                        if ts < cutoff:
+                            continue
+                    except Exception:
                         continue
-                except Exception:
-                    continue
-                rows.append(row)
+                    rows.append(row)
+        except Exception:
+            continue
 
     if not rows:
         return f"No token log data in the last {days} days."
