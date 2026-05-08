@@ -108,21 +108,25 @@ def _on_api_request(
     try:
         u = usage or {}
         logger_t = get_token_logger()
+        # Field names match CanonicalUsage.asdict() from usage_pricing.py:
+        #   cache_read_tokens  = DeepSeek cache HIT (prompt_cache_hit_tokens)
+        #   input_tokens        = DeepSeek cache MISS (non-cached prompt)
+        #   cache_write_tokens  = 0 for DeepSeek
         logger_t.log(
             session_id=session_id or None,
             provider=provider or None,
             model=model or response_model or "",
             api_call_n=api_call_count or 0,
             # Input token breakdown
-            input_tokens=int(u.get("prompt_tokens", 0)),
-            cache_hit_tokens=int(u.get("prompt_cache_hit_tokens", 0)),
-            cache_miss_tokens=int(u.get("prompt_cache_miss_tokens", 0)),
-            cache_write_tokens=int(u.get("prompt_cache_write_tokens", 0)),
+            input_tokens=int(u.get("input_tokens", 0)),
+            cache_hit_tokens=int(u.get("cache_read_tokens", 0)),
+            cache_miss_tokens=0,  # DeepSeek miss = input_tokens - cache_read (already in input_tokens)
+            cache_write_tokens=int(u.get("cache_write_tokens", 0)),
             # Output tokens
-            output_tokens=int(u.get("completion_tokens", 0)),
+            output_tokens=int(u.get("output_tokens", 0)),
             reasoning_tokens=int(u.get("reasoning_tokens", 0)),
             total_tokens=int(u.get("total_tokens", 0)),
-            # Cost (may come back as 0 if provider not recognised yet)
+            # Cost
             cost_usd=float(u.get("cost_usd", 0.0)),
             cost_status=u.get("cost_status", ""),
             cost_source=u.get("cost_source", ""),
