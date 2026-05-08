@@ -1,0 +1,10 @@
+name: token-logger
+version: "1.0.0"
+description: "Per-call CSV token logging for Hermes Agent — logs DeepSeek cache hit/miss, costs, and latency to ~/.hermes/token_logs/. Enable with `hermes plugins enable token-logger`."
+author: underdown
+requires_env: []
+provides_tools:
+  - token-summary
+provides_hooks:
+  - post_api_request
+kind: standalone
