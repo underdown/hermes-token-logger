@@ -76,13 +76,32 @@ TOOL_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def handle_token_summary(
+    args: dict | None = None,
     days: int = 7,
     **_kwargs,
 ) -> str:
     """
     Tool handler for token_summary.  Returns a plain-text table.
+
+    The plugin tool contract is ``handler(args, **kwargs)``: the dispatcher
+    passes the model's argument dict as the FIRST POSITIONAL argument
+    (tools/registry.py ``entry.handler(args, **kwargs)``).  So ``args`` must be
+    accepted positionally here and the real ``days`` value pulled out of it.
+    A handler declared ``(days=7, ...)`` instead binds the whole args dict to
+    ``days`` and dies on ``int(dict)``.
     """
-    days = min(max(int(days), 1), 30)
+    if isinstance(args, dict):
+        raw_days = args.get("days", days)
+    elif args is None:
+        raw_days = days
+    else:
+        # Tolerate a direct call as handle_token_summary(7).
+        raw_days = args
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        days = 7
+    days = min(max(days, 1), 30)
     return summarize_logs(days=days)
 
 
