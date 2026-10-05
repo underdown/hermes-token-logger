@@ -25,9 +25,21 @@ from pathlib import Path
 # creates a synthetic package hermes_plugins.token_logger so relative imports
 # work.  When imported standalone for testing we fall back to a bare import.
 try:
-    from .token_logger import TokenLogger, get_token_logger, summarize_logs
+    from .token_logger import (
+        TokenLogger,
+        get_token_logger,
+        summarize_logs,
+        import_existing_logs,
+        reconcile,
+    )
 except ImportError:  # pragma: no cover — standalone test path
-    from token_logger import TokenLogger, get_token_logger, summarize_logs  # type: ignore[no-redef]
+    from token_logger import (  # type: ignore[no-redef]
+        TokenLogger,
+        get_token_logger,
+        summarize_logs,
+        import_existing_logs,
+        reconcile,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -216,13 +228,20 @@ def _on_api_request(
         cost_status = u.get("cost_status", "")
         cost_source = u.get("cost_source", "")
 
+        # Bind this BEFORE the cost-supplement branch. It used to be assigned
+        # only inside that branch, so any future hook payload that carried a
+        # real cost_usd skipped the branch and then raised NameError on the
+        # logger.log() call below — silently dropping the row via the
+        # fail-open except. CanonicalUsage currently has no cost fields, so the
+        # branch always runs today and the bug is latent, not active.
+        model_raw = (
+            u.get("model_raw", "")
+            or response_model
+            or ""
+        )
+
         # Supplement with pricing-tools cache if cost is unknown/missing
         if (cost_status == "unknown" or cost_usd == 0.0) and provider:
-            model_raw = (
-                u.get("model_raw", "")
-                or response_model
-                or ""
-            )
             supp_cost, supp_source = _supplement_cost_from_pricing_plugin(
                 provider.lower(), model_raw, u
             )
@@ -230,16 +249,24 @@ def _on_api_request(
                 cost_usd = supp_cost
                 cost_source = supp_source or cost_source
 
+        # CanonicalUsage has no separate cache-miss bucket: misses are simply
+        # the input tokens that were not served from cache. Derive them instead
+        # of writing a hardcoded 0, which left the column dead on every row.
+        _inp = int(u.get("input_tokens", 0))
+        _cr = int(u.get("cache_read_tokens", 0))
+        _cw = int(u.get("cache_write_tokens", 0))
+        _cache_miss = max(0, _inp - _cr)
+
         logger_t.log(
             session_id=session_id or None,
             provider=provider or None,
             model=model_raw or response_model or "",
             api_call_n=api_call_count or 0,
             # Input token breakdown
-            input_tokens=int(u.get("input_tokens", 0)),
-            cache_hit_tokens=int(u.get("cache_read_tokens", 0)),
-            cache_miss_tokens=0,  # DeepSeek miss = input_tokens - cache_read (already in input_tokens)
-            cache_write_tokens=int(u.get("cache_write_tokens", 0)),
+            input_tokens=_inp,
+            cache_hit_tokens=_cr,
+            cache_miss_tokens=_cache_miss,
+            cache_write_tokens=_cw,
             # Output tokens
             output_tokens=int(u.get("output_tokens", 0)),
             reasoning_tokens=int(u.get("reasoning_tokens", 0)),
@@ -249,15 +276,77 @@ def _on_api_request(
             cost_status=cost_status if cost_status else "supplemented",
             cost_source=cost_source,
             latency_s=api_duration,
+            tool_call_count=assistant_tool_call_count,
         )
+        _reset_hook_failures()
     except Exception as exc:
-        # Fail-open: never let a logging error affect the agent
+        # Fail-open: never let a logging error affect the agent. But do NOT stay
+        # silent — a swallowed exception here means the row is lost with no
+        # trace. Count consecutive failures and surface them once the threshold
+        # is crossed; a broken logger must not be invisible.
+        _note_hook_failure(exc)
         logger.debug("token-logger hook error (non-fatal): %s", exc)
+
+
+# Consecutive-failure tracking for the fail-open path. A single blip is normal
+# (a provider returning an odd usage dict); a sustained run means every row is
+# being dropped, which is silent data loss.
+_HOOK_FAIL_COUNT = 0
+_HOOK_FAIL_REPORTED = False
+_HOOK_FAIL_THRESHOLD = 5
+
+
+def _note_hook_failure(exc: Exception) -> None:
+    global _HOOK_FAIL_COUNT, _HOOK_FAIL_REPORTED
+    _HOOK_FAIL_COUNT += 1
+    if _HOOK_FAIL_COUNT >= _HOOK_FAIL_THRESHOLD and not _HOOK_FAIL_REPORTED:
+        _HOOK_FAIL_REPORTED = True
+        logger.warning(
+            "token-logger has dropped %d consecutive API-call rows (last error: %r). "
+            "Token/cost logging is incomplete until this is fixed.",
+            _HOOK_FAIL_COUNT, exc,
+        )
+
+
+def _reset_hook_failures() -> None:
+    """Call after a successful log() so the counter reflects *consecutive* drops."""
+    global _HOOK_FAIL_COUNT, _HOOK_FAIL_REPORTED
+    if _HOOK_FAIL_COUNT:
+        _HOOK_FAIL_COUNT = 0
+        _HOOK_FAIL_REPORTED = False
 
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+def _catch_up_database() -> None:
+    """Bring SQLite level with the CSV archives at plugin start.
+
+    import_existing_logs() used to be a one-shot migration that nothing ever
+    called, which left the database permanently short of the archives and made
+    /token-summary under-report spend by ~97% with no warning. It is idempotent
+    (content-hash key + INSERT OR IGNORE), so running it on every load is
+    safe and self-healing.
+    """
+    try:
+        result = import_existing_logs()
+        if result["imported"] or result["refreshed"]:
+            logger.info(
+                "token-logger backfill: imported %d rows from CSV archives, "
+                "priced %d previously-unpriced rows (%d archives unreadable)",
+                result["imported"], result["refreshed"], result["files_corrupt"],
+            )
+        if result["files_corrupt"]:
+            logger.warning(
+                "token-logger: %d CSV archive(s) unreadable and NOT in SQLite: %s",
+                result["files_corrupt"], ", ".join(result["corrupt_files"][:8]),
+            )
+    except Exception as exc:
+        # Never block plugin load on a backfill problem; reconciliation in
+        # summarize_logs() will surface any resulting gap to the user.
+        logger.warning("token-logger backfill failed (non-fatal): %s", exc)
+
 
 def register(ctx) -> None:
     """
@@ -267,6 +356,8 @@ def register(ctx) -> None:
       - post_api_request hook  -> logs each API call to CSV
       - token_summary tool     -> user-facing usage summary
     """
+    _catch_up_database()
+
     ctx.register_hook("post_api_request", _on_api_request)
     ctx.register_tool(
         name="token_summary",

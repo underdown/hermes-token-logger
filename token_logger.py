@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import io
 import os
 import sqlite3
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS api_calls (
     cost_status TEXT DEFAULT '',
     cost_source TEXT DEFAULT '',
     cache_hit_rate_pct REAL DEFAULT 0.0,
-    latency_s REAL DEFAULT 0.0
+    latency_s REAL DEFAULT 0.0,
+    tool_call_count INTEGER DEFAULT 0
 )
 """
 
@@ -75,6 +77,60 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_api_calls_model ON api_calls(model)",
     "CREATE INDEX IF NOT EXISTS idx_api_calls_date ON api_calls(date(timestamp))",
 ]
+
+_COLUMNS_SQL = [
+    "timestamp", "session_id", "provider", "model", "api_call_n",
+    "input_tokens", "cache_hit_tokens", "cache_miss_tokens", "cache_write_tokens",
+    "output_tokens", "reasoning_tokens", "total_tokens",
+    "cost_usd", "cost_status", "cost_source", "cache_hit_rate_pct", "latency_s",
+    "tool_call_count",
+]
+
+_INSERT_COLUMNS_SQL = ", ".join(_COLUMNS_SQL + ["row_key"])
+_PLACEHOLDERS_SQL = ", ".join(["?"] * (len(_COLUMNS_SQL) + 1))
+INSERT_SQL = (
+    f"INSERT OR IGNORE INTO api_calls ({_INSERT_COLUMNS_SQL}) "
+    f"VALUES ({_PLACEHOLDERS_SQL})"
+)
+
+
+def _row_key(values: tuple) -> str:
+    """Content hash identifying one logged call.
+
+    (timestamp, session_id, api_call_n) is NOT unique: timestamps have
+    one-second resolution, so two genuinely different calls in the same second
+    with the same api_call_n collide. The archives contain 21 such collisions
+    (different cost and latency, same key), which made a unique index on those
+    three columns silently drop one row of each pair and made a cost-refresh
+    pass flip-flop between the two values forever.
+
+    Hashing the full payload makes the key both unique and idempotent: the same
+    call always produces the same key (so re-imports are no-ops), while two
+    distinct calls never collide.
+    """
+    payload = "\x1f".join(
+        f"{v:.6f}" if isinstance(v, float) else str(v) for v in values
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _ensure_row_key_column(db: sqlite3.Connection) -> None:
+    """Add row_key and the content-hash index to an older database."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(api_calls)")}
+    if "row_key" not in cols:
+        db.execute("ALTER TABLE api_calls ADD COLUMN row_key TEXT DEFAULT ''")
+    rows = db.execute(
+        "SELECT id, " + ", ".join(_COLUMNS_SQL) +
+        " FROM api_calls WHERE row_key IS NULL OR row_key = ''"
+    ).fetchall()
+    updates = [(_row_key(tuple(r[1:])), r[0]) for r in rows]
+    if updates:
+        db.executemany("UPDATE api_calls SET row_key = ? WHERE id = ?", updates)
+        db.commit()
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_calls_rowkey ON api_calls(row_key)"
+    )
+    db.commit()
 
 # ---------------------------------------------------------------------------
 # TokenLogger
@@ -111,6 +167,7 @@ class TokenLogger:
         # Derived
         "cache_hit_rate_pct",
         "latency_s",
+        "tool_call_count",
     ]
 
     def __init__(self, log_dir: Path = _TOKEN_LOG_DIR, db_path: Path = _TOKEN_DB_PATH) -> None:
@@ -140,6 +197,7 @@ class TokenLogger:
         self._db.execute(_CREATE_TABLE_SQL)
         for idx_sql in _CREATE_INDEXES_SQL:
             self._db.execute(idx_sql)
+        _ensure_row_key_column(self._db)
         self._db.commit()
 
     def _ensure_open(self) -> None:
@@ -185,6 +243,7 @@ class TokenLogger:
         cost_status: str,
         cost_source: str,
         latency_s: float,
+        tool_call_count: int = 0,
     ) -> None:
         """
         Record one API call.
@@ -226,6 +285,7 @@ class TokenLogger:
             "cost_source": cost_source,
             "cache_hit_rate_pct": cache_hit_rate,
             "latency_s": round(latency_s, 3),
+            "tool_call_count": tool_call_count,
         }
 
         self._writer.writerow(row)
@@ -234,21 +294,15 @@ class TokenLogger:
         # Dual-write to SQLite for fast queries
         if self._db is not None:
             try:
-                self._db.execute(
-                    """INSERT INTO api_calls (
-                        timestamp, session_id, provider, model, api_call_n,
-                        input_tokens, cache_hit_tokens, cache_miss_tokens, cache_write_tokens,
-                        output_tokens, reasoning_tokens, total_tokens,
-                        cost_usd, cost_status, cost_source, cache_hit_rate_pct, latency_s
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        row["timestamp"], row["session_id"], row["provider"], row["model"], row["api_call_n"],
-                        row["input_tokens"], row["cache_hit_tokens"], row["cache_miss_tokens"], row["cache_write_tokens"],
-                        row["output_tokens"], row["reasoning_tokens"], row["total_tokens"],
-                        row["cost_usd"], row["cost_status"], row["cost_source"],
-                        row["cache_hit_rate_pct"], row["latency_s"],
-                    ),
+                values = (
+                    row["timestamp"], row["session_id"], row["provider"], row["model"],
+                    row["api_call_n"], row["input_tokens"], row["cache_hit_tokens"],
+                    row["cache_miss_tokens"], row["cache_write_tokens"],
+                    row["output_tokens"], row["reasoning_tokens"], row["total_tokens"],
+                    row["cost_usd"], row["cost_status"], row["cost_source"],
+                    row["cache_hit_rate_pct"], row["latency_s"], row["tool_call_count"],
                 )
+                self._db.execute(INSERT_SQL, values + (_row_key(values),))
                 self._db.commit()
             except Exception:
                 pass  # fail-open: don't let DB errors affect the agent
@@ -298,15 +352,26 @@ def summarize_logs(days: int = 7) -> str:
     )
     cutoff_str = cutoff.isoformat(timespec="seconds")
 
-    # Try SQLite first
+    # Try SQLite first. Reconcile it against the CSV archives afterwards and
+    # prepend a warning if they disagree — the DB is only trustworthy as a
+    # fast path if the two agree, and a silent partial backfill once made this
+    # tool report 3% of real spend with no indication anything was wrong.
+    sqlite_used = False
     if _TOKEN_DB_PATH.exists():
         try:
-            return _summarize_from_sqlite(days, cutoff_str)
+            body = _summarize_from_sqlite(days, cutoff_str)
+            sqlite_used = True
         except Exception:
-            pass  # fall through to CSV scan
+            body = None  # fall through to CSV scan
 
-    # Fallback: scan uncompressed CSV and gzip CSV files
-    return _summarize_from_csv_files(days)
+    if not sqlite_used:
+        return _summarize_from_csv_files(days)
+
+    try:
+        notice = reconcile_notice()
+    except Exception as exc:
+        notice = f"  WARNING: reconciliation failed: {exc!r}\n"
+    return notice + body if notice else body
 
 
 def _summarize_from_sqlite(days: int, cutoff: str) -> str:
@@ -511,24 +576,187 @@ def _summarize_from_csv_files(days: int) -> str:
 # Migration: import existing CSV/gzip data into SQLite
 # ---------------------------------------------------------------------------
 
-def import_existing_logs() -> dict:
-    """Import all readable data from existing CSV and gzip-CSV files into SQLite.
+def _num(val, cast=int, default=0):
+    """Coerce a CSV cell to a number, falling back to default on junk."""
+    try:
+        return cast(val) if val not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
 
-    Called once after upgrade to populate the database. Safe to run multiple
-    times — existing rows are skipped by timestamp+session_id+api_call_n.
 
-    Returns a dict with counts: {imported: N, skipped: N, files_ok: N, files_corrupt: N}
+def _price_unpriced_rows(db: sqlite3.Connection, path: Path, num=_num) -> int:
+    """Fill in cost for DB rows still at 0.0 but priced in ``path``.
+
+    Targets only rows whose stored cost is exactly 0.0, so a row that already
+    carries a real price is never overwritten and repeated runs converge
+    instead of oscillating between two candidate values.
+    """
+    updated = 0
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, mode="rt" if path.suffix == ".gz" else "r",
+               encoding="utf-8", errors="replace") as fh:
+        for row in csv.DictReader(fh):
+            cost = num(row.get("cost_usd"), float, 0.0)
+            if cost <= 0:
+                continue
+            updated += db.execute(
+                """UPDATE api_calls
+                      SET cost_usd = ?, cost_status = ?, cost_source = ?
+                    WHERE timestamp = ? AND session_id = ? AND api_call_n = ?
+                      AND cost_usd = 0.0""",
+                (
+                    cost,
+                    row.get("cost_status", ""),
+                    row.get("cost_source", ""),
+                    row.get("timestamp", ""),
+                    row.get("session_id", ""),
+                    num(row.get("api_call_n")),
+                ),
+            ).rowcount
+    return updated
+
+
+def import_existing_logs(days: Optional[int] = None) -> dict:
+    """Backfill SQLite from the CSV/gzip archives. Safe to run repeatedly.
+
+    This was originally a one-shot v2.0.0 migration that nothing ever called,
+    so the database silently kept only the rows written live after the upgrade
+    and ``token_summary`` under-reported real spend by ~97%. It is now an
+    idempotent catch-up run on every plugin start: rows are keyed on a content
+    hash (see ``_row_key``) and inserted with INSERT OR IGNORE, so a re-run
+    costs one indexed scan and adds nothing.
+
+    Rows that are still at zero cost also get priced from the archive.
+    pricing-tools' enrich_logs.py rewrites cost_usd in the CSV *after* those
+    rows reach SQLite, so a plain insert would leave a stale 0.0 behind
+    permanently.
+
+    Args:
+        days: only backfill archives whose date tag is within this many days.
+              None (default) scans every archive.
+
+    Returns: {imported, refreshed, files_ok, files_corrupt, corrupt_files}
     """
     db = sqlite3.connect(str(_TOKEN_DB_PATH))
     db.execute("PRAGMA journal_mode=WAL")
     db.execute(_CREATE_TABLE_SQL)
     for idx_sql in _CREATE_INDEXES_SQL:
         db.execute(idx_sql)
+    _ensure_row_key_column(db)
 
     imported = 0
-    skipped = 0
+    refreshed = 0
     files_ok = 0
     files_corrupt = 0
+    corrupt_files: list[str] = []
+
+    cutoff_day = None
+    if days is not None:
+        cutoff_day = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).strftime("%Y-%m-%d")
+
+    for pattern in ["*.csv", "*.csv.gz"]:
+        for path in sorted(_TOKEN_LOG_DIR.glob(pattern)):
+            if cutoff_day and path.name.split(".")[0] < cutoff_day:
+                continue
+            try:
+                opener = gzip.open if path.suffix == ".gz" else open
+                with opener(path, mode="rt" if path.suffix == ".gz" else "r",
+                           encoding="utf-8", errors="replace") as fh:
+                    batch: list[tuple] = []
+                    for row in csv.DictReader(fh):
+                        values = (
+                            row.get("timestamp", ""),
+                            row.get("session_id", ""),
+                            row.get("provider", ""),
+                            row.get("model", ""),
+                            _num(row.get("api_call_n")),
+                            _num(row.get("input_tokens")),
+                            _num(row.get("cache_hit_tokens")),
+                            _num(row.get("cache_miss_tokens")),
+                            _num(row.get("cache_write_tokens")),
+                            _num(row.get("output_tokens")),
+                            _num(row.get("reasoning_tokens")),
+                            _num(row.get("total_tokens")),
+                            _num(row.get("cost_usd"), float, 0.0),
+                            row.get("cost_status", ""),
+                            row.get("cost_source", ""),
+                            _num(row.get("cache_hit_rate_pct"), float, 0.0),
+                            _num(row.get("latency_s"), float, 0.0),
+                            _num(row.get("tool_call_count")),
+                        )
+                        batch.append(values + (_row_key(values),))
+                        if len(batch) >= 1000:
+                            imported += db.executemany(INSERT_SQL, batch).rowcount
+                            batch = []
+                    if batch:
+                        imported += db.executemany(INSERT_SQL, batch).rowcount
+                refreshed += _price_unpriced_rows(db, path)
+                db.commit()
+                files_ok += 1
+            except Exception:
+                # Most common cause: a truncated/corrupt gzip archive. Record it
+                # rather than losing the fact that data is unreadable.
+                files_corrupt += 1
+                corrupt_files.append(path.name)
+
+    db.close()
+    return {"imported": imported, "refreshed": refreshed,
+            "files_ok": files_ok, "files_corrupt": files_corrupt,
+            "corrupt_files": corrupt_files}
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation: DB vs CSV ground truth
+# ---------------------------------------------------------------------------
+
+def reconcile(window_days: int = 30) -> dict:
+    """Compare SQLite against the CSV archives and report divergence.
+
+    ``token_summary`` trusts SQLite because it is the fast path. That is only
+    safe if the two agree. This walks the archives for the recent window and
+    returns per-day call/cost counts from both sources, plus any unreadable
+    archives, so a partial backfill can never again masquerade as a healthy
+    database.
+
+    Returns: ok, db_calls, csv_calls, db_cost, csv_cost, missing_calls,
+    missing_cost, missing_cost_pct, days, corrupt_files.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    cutoff_str = cutoff.isoformat(timespec="seconds")
+    cutoff_ts = cutoff.timestamp()
+
+    result = {
+        "ok": True, "db_calls": 0, "csv_calls": 0,
+        "db_cost": 0.0, "csv_cost": 0.0,
+        "missing_calls": 0, "missing_cost": 0.0, "missing_cost_pct": 0.0,
+        "days": {}, "corrupt_files": [],
+    }
+
+    if _TOKEN_DB_PATH.exists():
+        try:
+            db = sqlite3.connect(str(_TOKEN_DB_PATH))
+            db.row_factory = sqlite3.Row
+            for r in db.execute(
+                """SELECT substr(timestamp,1,10) AS day, COUNT(*) AS calls,
+                          COALESCE(SUM(cost_usd),0) AS cost
+                   FROM api_calls WHERE timestamp >= ? GROUP BY day""",
+                (cutoff_str,),
+            ):
+                slot = result["days"].setdefault(
+                    r["day"], {"db_calls": 0, "db_cost": 0.0}
+                )
+                slot["db_calls"] = r["calls"]
+                slot["db_cost"] = r["cost"]
+                result["db_calls"] += r["calls"]
+                result["db_cost"] += r["cost"]
+            db.close()
+        except Exception as exc:
+            result["ok"] = False
+            result["error"] = f"sqlite read failed: {exc!r}"
 
     for pattern in ["*.csv", "*.csv.gz"]:
         for path in sorted(_TOKEN_LOG_DIR.glob(pattern)):
@@ -536,57 +764,65 @@ def import_existing_logs() -> dict:
                 opener = gzip.open if path.suffix == ".gz" else open
                 with opener(path, mode="rt" if path.suffix == ".gz" else "r",
                            encoding="utf-8", errors="replace") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        # Check for duplicates
-                        exists = db.execute(
-                            """SELECT 1 FROM api_calls
-                               WHERE timestamp = ? AND session_id = ?
-                               AND (api_call_n = ? OR (api_call_n = 0 AND ? = 0))
-                               LIMIT 1""",
-                            (row.get("timestamp", ""), row.get("session_id", ""),
-                             int(row.get("api_call_n", 0) or 0), int(row.get("api_call_n", 0) or 0)),
-                        ).fetchone()
-                        if exists:
-                            skipped += 1
-                            continue
-
+                    for row in csv.DictReader(fh):
                         try:
-                            db.execute(
-                                """INSERT INTO api_calls (
-                                    timestamp, session_id, provider, model, api_call_n,
-                                    input_tokens, cache_hit_tokens, cache_miss_tokens, cache_write_tokens,
-                                    output_tokens, reasoning_tokens, total_tokens,
-                                    cost_usd, cost_status, cost_source, cache_hit_rate_pct, latency_s
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (
-                                    row.get("timestamp", ""),
-                                    row.get("session_id", ""),
-                                    row.get("provider", ""),
-                                    row.get("model", ""),
-                                    int(row.get("api_call_n", 0) or 0),
-                                    int(row.get("input_tokens", 0) or 0),
-                                    int(row.get("cache_hit_tokens", 0) or 0),
-                                    int(row.get("cache_miss_tokens", 0) or 0),
-                                    int(row.get("cache_write_tokens", 0) or 0),
-                                    int(row.get("output_tokens", 0) or 0),
-                                    int(row.get("reasoning_tokens", 0) or 0),
-                                    int(row.get("total_tokens", 0) or 0),
-                                    float(row.get("cost_usd", 0) or 0),
-                                    row.get("cost_status", ""),
-                                    row.get("cost_source", ""),
-                                    float(row.get("cache_hit_rate_pct", 0) or 0),
-                                    float(row.get("latency_s", 0) or 0),
-                                ),
-                            )
-                            imported += 1
+                            if datetime.fromisoformat(
+                                row["timestamp"]
+                            ).timestamp() < cutoff_ts:
+                                continue
+                            day = row["timestamp"][:10]
+                            cost = float(row.get("cost_usd") or 0)
                         except Exception:
-                            skipped += 1
-                db.commit()
-                files_ok += 1
+                            continue
+                        slot = result["days"].setdefault(
+                            day, {"db_calls": 0, "db_cost": 0.0}
+                        )
+                        slot["csv_calls"] = slot.get("csv_calls", 0) + 1
+                        slot["csv_cost"] = slot.get("csv_cost", 0.0) + cost
+                        result["csv_calls"] += 1
+                        result["csv_cost"] += cost
             except Exception:
-                files_corrupt += 1
+                result["corrupt_files"].append(path.name)
 
-    db.close()
-    return {"imported": imported, "skipped": skipped,
-            "files_ok": files_ok, "files_corrupt": files_corrupt}
+    result["missing_calls"] = max(0, result["csv_calls"] - result["db_calls"])
+    result["missing_cost"] = max(0.0, result["csv_cost"] - result["db_cost"])
+    if result["csv_cost"] > 0:
+        result["missing_cost_pct"] = round(
+            100 * result["missing_cost"] / result["csv_cost"], 1
+        )
+
+    if result["missing_calls"] > 0 or result["missing_cost"] > 0.005:
+        result["ok"] = False
+    return result
+
+
+def reconcile_notice() -> str:
+    """Warning block for token_summary, or '' when DB and archives agree."""
+    try:
+        rec = reconcile()
+    except Exception as exc:
+        return f"  WARNING: could not reconcile DB against CSV archives: {exc!r}\n"
+
+    if rec["ok"]:
+        return ""
+
+    lines = [
+        "  " + "!" * 66,
+        "  WARNING: SQLite is behind the CSV archives. Numbers below are",
+        "  INCOMPLETE — do not treat the totals as your real spend.",
+        f"    DB (reported): {rec['db_calls']:,} calls  ${rec['db_cost']:.4f}",
+        f"    CSV (actual):  {rec['csv_calls']:,} calls  ${rec['csv_cost']:.4f}",
+        f"    Missing:       {rec['missing_calls']:,} calls  "
+        f"${rec['missing_cost']:.4f}  ({rec['missing_cost_pct']}% of spend)",
+    ]
+    if rec["corrupt_files"]:
+        shown = ", ".join(rec["corrupt_files"][:6])
+        extra = (f" (+{len(rec['corrupt_files']) - 6} more)"
+                 if len(rec["corrupt_files"]) > 6 else "")
+        lines.append(f"    Unreadable archives: {shown}{extra}")
+    lines += [
+        "    Fix: the plugin backfills automatically on next start, or run",
+        "         python3 -c \"import token_logger; token_logger.import_existing_logs()\"",
+        "  " + "!" * 66,
+    ]
+    return "\n".join(lines) + "\n"
