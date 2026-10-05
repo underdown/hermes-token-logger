@@ -1,8 +1,8 @@
 # hermes-token-logger
 
-A Hermes Agent plugin that logs every API call to plain-text CSV files AND a SQLite database — with full DeepSeek cache-hit/miss breakdowns, token counts, and cost estimates.
+A Hermes Agent plugin that logs every API call to plain-text CSV files AND a SQLite database — with cache hit/miss breakdowns, token counts, and cost estimates.
 
-**v2.0.0 — SQLite dual-write.** Crash-safe: no more gzip corruption from process restarts. The database enables sub-millisecond queries across arbitrary date ranges.
+**v2.1.0 — self-healing database.** The plugin now backfills SQLite from the CSV archives on every start, and `/token-summary` reconciles the two sources and warns when they disagree. Cache-miss counts are real instead of a placeholder. The database can no longer fall behind the archives without saying so.
 
 ---
 
@@ -103,8 +103,8 @@ Every row = one API call.
 | `model` | string | Full model string, e.g. `deepseek-ai/deepseek-v4-pro` |
 | `api_call_n` | int | Call number within this session (1-based) |
 | `input_tokens` | int | Non-cached prompt tokens |
-| `cache_hit_tokens` | int | DeepSeek prompt cache hit tokens |
-| `cache_miss_tokens` | int | DeepSeek prompt cache miss tokens |
+| `cache_hit_tokens` | int | Prompt tokens served from cache |
+| `cache_miss_tokens` | int | Prompt tokens not served from cache (`input_tokens - cache_hit_tokens`) |
 ## Configuration
 
 No configuration required. The plugin uses Hermes's built-in pricing table for cost estimation.
@@ -150,10 +150,19 @@ Hermes has a plugin system with lifecycle hooks. This plugin registers one hook 
 | Hook | `post_api_request` | After every API call completes |
 | Tool | `token_summary` | When called from conversation or CLI |
 
-The `post_api_request` hook receives Hermes's internal usage dict, extracts token breakdowns and DeepSeek cache fields, then writes to TWO places simultaneously:
+The `post_api_request` hook receives Hermes's internal usage dict, extracts token breakdowns and cache fields, then writes to TWO places simultaneously:
 
 1. **Plain-text CSV** (`YYYY-MM-DD.csv`) — append-only, crash-safe. A process restart mid-write leaves a readable partial file.
 2. **SQLite database** (`token_logs.db`) — ACID-compliant, indexed, sub-millisecond queries. Powers the `token_summary` tool.
+
+The two are kept in agreement automatically. On plugin start the plugin reads the
+CSV archives and inserts any rows the database is missing, then fills in cost
+for rows that were written without one. Each call is identified by a hash of its
+contents, which makes the import safe to repeat.
+
+Before `/token-summary` prints its numbers, it compares the database against the
+archives. If they disagree it prints a warning naming the calls and dollars
+missing, so a stale database cannot report a plausible-looking total.
 
 A nightly cron job at 1am UTC gzips yesterday's finalized CSV and vacuums the SQLite database.
 
@@ -161,13 +170,11 @@ A nightly cron job at 1am UTC gzips yesterday's finalized CSV and vacuums the SQ
 API call → Hermes normalises usage → post_api_request hook fires → CSV + SQLite written
 ```
 
-If CSV or DB writing fails, the error is logged and swallowed — the agent never notices.
+If CSV or DB writing fails, the error is logged and swallowed — the agent never notices. Five consecutive failures raise a warning, so a logger that has stopped recording does not stay quiet.
 
 ---
 
-## Upgrading from v1.x to v2.0
-
-v2.0 replaces gzip CSV append with plain-text CSV + SQLite dual-write. To upgrade:
+## Upgrading
 
 ```bash
 # Pull latest
@@ -175,12 +182,30 @@ cd ~/.hermes/plugins/token-logger && git pull
 
 # Restart Hermes (or reload plugins)
 hermes plugins disable token-logger && hermes plugins enable token-logger
-
-# Migrate existing data into SQLite
-python3 -c "from token_logger import import_existing_logs; print(import_existing_logs())"
 ```
 
-Your old `.csv.gz` files are left intact. The migration imports whatever is readable from them into the new SQLite database. Corrupt gzip files (common in v1.x) will be reported as `files_corrupt` — their data is unrecoverable, but new writes from v2.0 are crash-safe.
+That is the whole upgrade. No manual migration step is needed.
+
+v2.0 introduced SQLite as a second store alongside the CSV files. v2.1 makes
+the CSV archives the recovery source: on every plugin start the plugin reads
+them and inserts anything the database is missing, so the database catches
+itself up. The import is idempotent, so re-running it costs one indexed scan
+and adds nothing.
+
+To backfill by hand, or to check what a run did:
+
+```bash
+cd ~/.hermes/plugins/token-logger
+python3 -c "from token_logger import import_existing_logs; print(import_existing_logs())"
+# {'imported': 0, 'refreshed': 0, 'files_ok': 88, 'files_corrupt': 7, 'corrupt_files': [...]}
+```
+
+`imported` counts rows added, `refreshed` counts rows that had no cost and
+now have one, and `files_corrupt` names any archive that could not be read.
+
+Your old `.csv.gz` files are left intact. Corrupt gzip files from v1.x are
+reported by name in `files_corrupt` and listed by `/token-summary`; their data
+is unrecoverable, but new writes have been crash-safe since v2.0.
 
 ---
 
